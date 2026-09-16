@@ -46,7 +46,7 @@ class DetailsModificationService
         // 🚫 Batasi akses hanya untuk user ID 1
         $user = Auth::user();
         if (!$user || $user->id !== 1) {
-            abort(403, '🚫 ANTI MODIFIKASI - KEAMANAN BY @REXZYSTR');
+            abort(403, '🚫 ANTI MODIFIKASI - KEAMANAN BY @RYOUKEN00');
         }
 
         return $this->connection->transaction(function () use ($data, $server) {
