@@ -1,0 +1,113 @@
+name: Flutter APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_url:
+        description: "URL ZIP project Flutter"
+        required: true
+        type: string
+
+      zip_url:
+        description: "URL ZIP project Flutter"
+        required: false
+        type: string
+
+      job_id:
+        description: "Build ID"
+        required: true
+        type: string
+
+      tag:
+        description: "Temporary release tag"
+        required: true
+        type: string
+
+      mode:
+        description: "Build mode"
+        required: false
+        default: release
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Project ZIP
+        env:
+          SOURCE_URL: ${{ inputs.input_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          mkdir -p project
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "$SOURCE_URL" \
+            -o /tmp/project.zip
+
+          unzip -q /tmp/project.zip -d project
+
+      - name: Find Flutter Project
+        run: |
+          set -e
+
+          PUBSPEC=$(find project -name pubspec.yaml -type f | head -n 1)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Flutter project ditemukan:"
+          echo "$PROJECT_DIR"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter Pub Get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk --release
+
+      - name: Collect APK
+        run: |
+          set -e
+
+          mkdir -p output
+
+          find "$PROJECT_DIR/build/app/outputs/flutter-apk" \
+            -name "*.apk" \
+            -type f \
+            -exec cp {} output/ \;
+
+          ls -lh output/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 1
