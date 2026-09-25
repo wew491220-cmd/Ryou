@@ -1,0 +1,471 @@
+name: Universal ZIP to APK (Genetik + Sign)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag release GitHub tempat ZIP diupload"
+        required: true
+        type: string
+
+      asset_name:
+        description: "Nama file asset ZIP"
+        required: true
+        type: string
+
+      build_type:
+        description: "Auto mendeteksi jenis project"
+        required: true
+        type: choice
+        options:
+          - auto
+          - android
+          - flutter
+          - webview
+        default: auto
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+
+    outputs:
+      assets: ${{ steps.parse.outputs.assets }}
+
+    steps:
+      - name: Parse daftar asset ZIP
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RAW="${{ inputs.asset_name }}"
+
+          ASSETS_JSON="$(printf '%s' "$RAW" \
+            | tr ',' '\n' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+            | grep -v '^$' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+
+          echo "Daftar ZIP yang akan dibuild:"
+          echo "$ASSETS_JSON"
+
+          echo "assets=$ASSETS_JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        asset: ${{ fromJson(needs.prepare.outputs.assets) }}
+
+    steps:
+
+      - name: Bersihkan ruang disk runner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo docker image prune -af || true
+
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-35 platforms;android-34 build-tools;35.0.0 build-tools;34.0.0
+
+      - name: Install Android SDK extras
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          for pkg in \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "build-tools;34.0.0"
+          do
+            echo "Installing $pkg..."
+            sdkmanager --install "$pkg" || \
+              echo "::warning::Gagal install $pkg"
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sanitize nama asset
+        id: sanitize
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SAFE="$(printf '%s' "${{ matrix.asset }}" \
+            | sed -E 's/\.[Zz][Ii][Pp]$//' \
+            | sed -E 's/[^A-Za-z0-9._-]+/-/g')"
+
+          echo "name=$SAFE" >> "$GITHUB_OUTPUT"
+
+      - name: Download ZIP dari Release
+        id: download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          set -euo pipefail
+
+          TAG="${{ inputs.release_tag }}"
+          ASSET="${{ matrix.asset }}"
+
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "$ASSET" \
+            --clobber
+
+          test -f "$ASSET"
+
+          echo "zip_path=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p workspace
+
+          ZIP="${{ steps.download.outputs.zip_path }}"
+
+          unzip -q "$ZIP" -d workspace
+
+          find workspace -maxdepth 4 -type f | sort | head -300
+
+      - name: Detect project
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUESTED="${{ inputs.build_type }}"
+
+          if [ "$REQUESTED" != "auto" ]; then
+            echo "type=$REQUESTED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if find workspace -type f -name "pubspec.yaml" -print -quit | grep -q .; then
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if find workspace -type f -name "gradlew" -print -quit | grep -q .; then
+            echo "type=android" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if find workspace -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -print -quit | grep -q .; then
+            echo "type=android" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if find workspace -type f -name "index.html" -print -quit | grep -q .; then
+            echo "type=webview" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if find workspace -type f -name "*.html" -print -quit | grep -q .; then
+            echo "type=webview" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "type=unknown" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Locate Flutter project
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(find workspace -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
+
+          test -n "$ROOT"
+
+          echo "FLUTTER_PROJECT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Ensure compatible Gradle version
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+
+          if [ -f "$WRAPPER" ]; then
+            echo "distributionUrl sebelum:"
+            grep distributionUrl "$WRAPPER" || true
+
+            sed -i -E \
+              's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' \
+              "$WRAPPER"
+
+            echo "distributionUrl sesudah:"
+            grep distributionUrl "$WRAPPER"
+          else
+            echo "gradle-wrapper.properties tidak ditemukan."
+          fi
+
+      - name: Ensure compatible AGP version
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MIN_AGP="8.12.1"
+
+          for FILE in \
+            android/settings.gradle \
+            android/settings.gradle.kts \
+            android/build.gradle \
+            android/build.gradle.kts
+          do
+            if [ -f "$FILE" ]; then
+              sed -i -E \
+                "s#(com\.android\.tools\.build:gradle:)[0-9.]+#\1${MIN_AGP}#g" \
+                "$FILE" || true
+            fi
+          done
+
+      - name: Ensure compatible Kotlin version
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MIN_KOTLIN="2.2.20"
+
+          for FILE in \
+            android/settings.gradle \
+            android/settings.gradle.kts \
+            android/build.gradle \
+            android/build.gradle.kts
+          do
+            if [ -f "$FILE" ]; then
+              sed -i -E \
+                "s#(kotlin-gradle-plugin:)[0-9.]+#\1${MIN_KOTLIN}#g" \
+                "$FILE" || true
+            fi
+          done
+
+      - name: Flutter dependencies
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          flutter build apk --release
+
+      - name: Collect Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p output
+
+          APK="$(find "$FLUTTER_PROJECT/build/app/outputs/flutter-apk" \
+            -type f -name "*.apk" -print -quit)"
+
+          test -n "$APK"
+
+          cp "$APK" output/app-release.apk
+
+      - name: Generate app icons
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT="$(find workspace -maxdepth 2 \
+            -type f -name generate_icons.py -print -quit)"
+
+          if [ -n "$SCRIPT" ]; then
+            SCRIPT_DIR="$(dirname "$SCRIPT")"
+            (cd "$SCRIPT_DIR" && python3 generate_icons.py)
+          fi
+
+      - name: Locate Android project
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(find workspace -type f -name gradlew \
+            -print -quit | xargs -r dirname)"
+
+          test -n "$ROOT"
+
+          echo "ANDROID_PROJECT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Build native Android APK
+        if: steps.detect.outputs.type == 'android'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x ./gradlew
+
+          ./gradlew assembleRelease \
+            --no-daemon \
+            --stacktrace
+
+      - name: Collect native Android APK
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p output
+
+          APK="$(find "$ANDROID_PROJECT" \
+            -type f \
+            -path "*/build/outputs/apk/*" \
+            -name "*.apk" \
+            -print -quit)"
+
+          test -n "$APK"
+
+          cp "$APK" output/app-release-unsigned.apk
+
+      - name: Unsupported ZIP
+        if: steps.detect.outputs.type == 'unknown'
+        run: |
+          echo "::error::ZIP tidak berisi project Android, Flutter, atau Web."
+          exit 1
+
+      - name: Sign release APK
+        if: success() && (steps.detect.outputs.type == 'android')
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f output/app-release-unsigned.apk ]; then
+            exit 1
+          fi
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          BT="$(find "$SDK_ROOT/build-tools" \
+            -maxdepth 1 -mindepth 1 -type d \
+            | sort -V | tail -1)"
+
+          if [ -z "$BT" ]; then
+            echo "::error::Android build-tools tidak ditemukan."
+            exit 1
+          fi
+
+          KS_FILE="release.keystore"
+
+          if [ -n "$KEYSTORE_BASE64" ] && \
+             [ -n "$KEYSTORE_PASSWORD" ] && \
+             [ -n "$KEY_ALIAS" ] && \
+             [ -n "$KEY_PASSWORD" ]; then
+
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KS_FILE"
+
+            KS_PASS="$KEYSTORE_PASSWORD"
+            KS_ALIAS="$KEY_ALIAS"
+            KEY_PASS="$KEY_PASSWORD"
+
+          else
+
+            KS_PASS="android"
+            KS_ALIAS="androiddebugkey"
+            KEY_PASS="android"
+
+            keytool -genkeypair -v \
+              -keystore "$KS_FILE" \
+              -storepass "$KS_PASS" \
+              -alias "$KS_ALIAS" \
+              -keypass "$KEY_PASS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Tirzz Debug,OU=Build,O=Tirzz,L=Jakarta,ST=JK,C=ID"
+
+          fi
+
+          "$BT/zipalign" -f 4 \
+            output/app-release-unsigned.apk \
+            output/aligned.apk
+
+          "$BT/apksigner" sign \
+            --ks "$KS_FILE" \
+            --ks-pass "pass:$KS_PASS" \
+            --ks-key-alias "$KS_ALIAS" \
+            --key-pass "pass:$KEY_PASS" \
+            --out output/app-release.apk \
+            output/aligned.apk
+
+          "$BT/apksigner" verify output/app-release.apk
+
+          rm -f \
+            "$KS_FILE" \
+            output/app-release-unsigned.apk \
+            output/aligned.apk
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.sanitize.outputs.name }}
+          path: output/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
