@@ -4,22 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Temporary GitHub Release tag containing the source ZIP
+        description: Temporary GitHub Release tag
         required: true
         type: string
+
       asset_name:
-        description: GitHub Release asset name containing the source ZIP
+        description: ZIP asset name
         required: true
         type: string
+
       build_type:
-        description: Build mode
+        description: Build type
         required: true
         type: choice
         options:
           - auto
-          - android
           - flutter
-          - webview
         default: auto
 
 permissions:
@@ -30,176 +30,302 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 70
-    steps:
-      - name: Checkout repository metadata
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
 
-      - name: Set up Java 17
+    steps:
+      - name: Setup Java 17
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v7
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install base tools
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y unzip curl jq
-          java -version
-          python --version
-          sdkmanager --version
 
-      - name: Download source ZIP from GitHub Release
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "build-tools;34.0.0"
+
+      - name: Download ZIP from GitHub Release
+        id: download
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          ASSET_NAME: ${{ inputs.asset_name }}
         run: |
           set -euo pipefail
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
-          release_json="$(curl --fail-with-body --silent --show-error \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${api}")"
 
-          asset_id="$(jq -r --arg name "${ASSET_NAME}" '.assets[] | select(.name == $name) | .id' <<<"${release_json}" | head -n 1)"
-          if [[ -z "${asset_id}" || "${asset_id}" == "null" ]]; then
-            echo "ERROR: Release asset not found: ${ASSET_NAME}" >&2
+          TAG="${{ inputs.release_tag }}"
+          ASSET="${{ inputs.asset_name }}"
+
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "$ASSET" \
+            --clobber
+
+          if [ ! -f "$ASSET" ]; then
+            echo "::error::Gagal download asset '$ASSET' dari release '$TAG'"
             exit 1
           fi
 
-          mkdir -p source
-          curl --fail-with-body --silent --show-error -L \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-            -o "source/${ASSET_NAME}"
+          echo "zip_path=$ASSET" >> "$GITHUB_OUTPUT"
 
-          unzip -t "source/${ASSET_NAME}"
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -qq "source/${ASSET_NAME}" -d extracted
+      - name: Extract ZIP
+        run: |
+          set -euo pipefail
 
-      - name: Detect project
+          mkdir -p workspace
+
+          ZIP="${{ steps.download.outputs.zip_path }}"
+
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::ZIP tidak ditemukan: $ZIP"
+            exit 1
+          fi
+
+          unzip -q "$ZIP" -d workspace
+
+          echo "Isi ZIP:"
+          find workspace -maxdepth 4 -type f | sort | head -300
+
+      - name: Detect Flutter project
         id: detect
         shell: bash
-        env:
-          REQUESTED_BUILD_TYPE: ${{ inputs.build_type }}
         run: |
           set -euo pipefail
 
-          root="$(find extracted -type f \( -name pubspec.yaml -o -name gradlew -o -name settings.gradle -o -name settings.gradle.kts -o -name AndroidManifest.xml \) -printf '%h\n' | sort -u | head -n 1 || true)"
-          if [[ -z "${root}" ]]; then
-            root="extracted"
+          REQUESTED="${{ inputs.build_type }}"
+
+          if [ "$REQUESTED" = "flutter" ]; then
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          if [[ -f "${root}/pubspec.yaml" ]]; then
-            detected="flutter"
-          elif [[ -f "${root}/gradlew" || -f "${root}/settings.gradle" || -f "${root}/settings.gradle.kts" ]]; then
-            if grep -Rqs --exclude-dir=.gradle --exclude-dir=build 'android.webkit.WebView' "${root}" 2>/dev/null; then
-              detected="webview"
-            else
-              detected="android"
-            fi
-          else
-            detected="unknown"
+          if find workspace \
+            -type f \
+            -name "pubspec.yaml" \
+            -print -quit | grep -q .; then
+
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          case "${REQUESTED_BUILD_TYPE}" in
-            auto) build_type="${detected}" ;;
-            flutter|android|webview) build_type="${REQUESTED_BUILD_TYPE}" ;;
-            *) echo "ERROR: unsupported build_type: ${REQUESTED_BUILD_TYPE}" >&2; exit 1 ;;
-          esac
+          echo "type=unknown" >> "$GITHUB_OUTPUT"
 
-          if [[ "${build_type}" == "flutter" && ! -f "${root}/pubspec.yaml" ]]; then
-            echo "ERROR: Flutter build requested but pubspec.yaml was not found." >&2
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Locate Flutter project
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(find workspace \
+            -type f \
+            -name pubspec.yaml \
+            -print -quit | xargs -r dirname)"
+
+          if [ -z "$ROOT" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
             exit 1
           fi
 
-          if [[ "${build_type}" == "android" || "${build_type}" == "webview" ]]; then
-            if [[ ! -f "${root}/gradlew" && ! -f "${root}/settings.gradle" && ! -f "${root}/settings.gradle.kts" ]]; then
-              echo "ERROR: Android/WebView build requested but Gradle project files were not found." >&2
-              exit 1
-            fi
-          fi
+          echo "FLUTTER_PROJECT=$ROOT" >> "$GITHUB_ENV"
 
-          echo "root=${root}" >> "$GITHUB_OUTPUT"
-          echo "build_type=${build_type}" >> "$GITHUB_OUTPUT"
-          printf 'Detected root: %s\nDetected build type: %s\n' "${root}" "${build_type}"
+          echo "Flutter project:"
+          echo "$ROOT"
 
-      - name: Install Flutter SDK
-        if: steps.detect.outputs.build_type == 'flutter'
+      - name: Configure Gradle 8.14.2 all.zip
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
         shell: bash
         run: |
           set -euo pipefail
-          FLUTTER_VERSION="stable"
-          git clone --depth 1 --branch "${FLUTTER_VERSION}" https://github.com/flutter/flutter.git "$HOME/flutter"
-          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
-          "$HOME/flutter/bin/flutter" --version
 
-      - name: Build Flutter APK
-        if: steps.detect.outputs.build_type == 'flutter'
-        working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          flutter pub get
-          flutter build apk --release
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
 
-      - name: Build Android APK
-        if: steps.detect.outputs.build_type == 'android' || steps.detect.outputs.build_type == 'webview'
-        working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -x ./gradlew ]]; then
-            ./gradlew assembleRelease
-          else
-            chmod +x ./gradlew 2>/dev/null || true
-            ./gradlew assembleRelease
-          fi
-
-      - name: Find APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          mapfile -t apks < <(find extracted -type f -iname '*.apk' -print | sort)
-          if (( ${#apks[@]} == 0 )); then
-            echo "ERROR: APK_NOT_FOUND: no APK file was produced." >&2
+          if [ ! -f "$WRAPPER" ]; then
+            echo "::error::gradle-wrapper.properties tidak ditemukan."
             exit 1
           fi
 
-          index=0
-          for apk in "${apks[@]}"; do
-            base="$(basename "${apk}")"
-            target="artifacts/${base}"
-            if [[ -e "${target}" ]]; then
-              index=$((index + 1))
-              target="artifacts/${index}-${base}"
+          echo "Gradle wrapper sebelum:"
+          grep "distributionUrl" "$WRAPPER" || true
+
+          sed -i -E \
+            's#distributionUrl=.*#distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' \
+            "$WRAPPER"
+
+          echo "Gradle wrapper sesudah:"
+          grep "distributionUrl" "$WRAPPER"
+
+          if ! grep -q "gradle-8.14.2-all.zip" "$WRAPPER"; then
+            echo "::error::Gradle wrapper bukan 8.14.2-all.zip"
+            exit 1
+          fi
+
+      - name: Configure AGP 8.12.1
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MIN_AGP="8.12.1"
+
+          for FILE in \
+            android/settings.gradle \
+            android/settings.gradle.kts \
+            android/build.gradle \
+            android/build.gradle.kts
+          do
+            if [ -f "$FILE" ]; then
+              echo "Checking AGP in $FILE"
+
+              sed -i -E \
+                "s#(id\\(?[\"']com\\.android\\.application[\"']\\)?[[:space:]]+version[[:space:]]+[\"'])[0-9.]+([\"'])#\\1${MIN_AGP}\\2#g" \
+                "$FILE"
+
+              sed -i -E \
+                "s#(classpath[[:space:]]+[\"']com\\.android\\.tools\\.build:gradle:)[0-9.]+([\"'])#\\1${MIN_AGP}\\2#g" \
+                "$FILE"
             fi
-            cp -f "${apk}" "${target}"
-            printf '%s\n' "${target}"
           done
 
+          echo "AGP configuration:"
+          grep -Rni \
+            "com.android.application\|com.android.tools.build:gradle" \
+            android \
+            --include="*.gradle" \
+            --include="*.gradle.kts" \
+            || true
+
+      - name: Configure Kotlin 2.2.20
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MIN_KOTLIN="2.2.20"
+
+          for FILE in \
+            android/settings.gradle \
+            android/settings.gradle.kts \
+            android/build.gradle \
+            android/build.gradle.kts
+          do
+            if [ -f "$FILE" ]; then
+              echo "Checking Kotlin in $FILE"
+
+              # plugins:
+              # id("org.jetbrains.kotlin.android") version "x.x.x"
+              sed -i -E \
+                "s#(id\\(?[\"']org\\.jetbrains\\.kotlin\\.android[\"']\\)?[[:space:]]+version[[:space:]]+[\"'])[0-9.]+([\"'])#\\1${MIN_KOTLIN}\\2#g" \
+                "$FILE"
+
+              # Legacy ext.kotlin_version
+              sed -i -E \
+                "s#(ext\\.kotlin_version[[:space:]]*=[[:space:]]*[\"'])[0-9.]+([\"'])#\\1${MIN_KOTLIN}\\2#g" \
+                "$FILE"
+
+              # Legacy kotlin-gradle-plugin
+              sed -i -E \
+                "s#(classpath[[:space:]]+[\"']org\\.jetbrains\\.kotlin:kotlin-gradle-plugin:)[0-9.]+([\"'])#\\1${MIN_KOTLIN}\\2#g" \
+                "$FILE"
+            fi
+          done
+
+          echo "Kotlin configuration:"
+          grep -Rni \
+            "org.jetbrains.kotlin.android\|kotlin_version\|kotlin-gradle-plugin" \
+            android \
+            --include="*.gradle" \
+            --include="*.gradle.kts" \
+            || true
+
+      - name: Flutter dependencies
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter --version
+          flutter pub get
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter build apk --release
+
+      - name: Collect Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p output
+
+          APK="$(
+            find "$FLUTTER_PROJECT/build/app/outputs/flutter-apk" \
+              -type f \
+              -name "*.apk" \
+              -print -quit
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK Flutter tidak ditemukan."
+            find "$FLUTTER_PROJECT/build" \
+              -type f \
+              -name "*.apk" \
+              -print \
+              || true
+            exit 1
+          fi
+
+          echo "APK ditemukan:"
+          echo "$APK"
+
+          cp "$APK" output/app-release.apk
+
+          echo "Output:"
+          ls -lh output/app-release.apk
+
+      - name: Unsupported project
+        if: steps.detect.outputs.type == 'unknown'
+        shell: bash
+        run: |
+          echo "::error::ZIP tidak berisi project Flutter."
+          exit 1
+
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v7
         with:
           name: apk-${{ inputs.release_tag }}
-          path: artifacts/*.apk
+          path: output/app-release.apk
           if-no-files-found: error
           retention-days: 1
